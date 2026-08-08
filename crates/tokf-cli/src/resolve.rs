@@ -6,6 +6,8 @@ use tokf::tracking;
 
 use tokf::runtime::Runtime;
 
+use crate::path_env::prepend_to_path;
+
 /// Result of filter resolution, including any deferred output-pattern variants.
 pub struct FilterMatch {
     pub config: FilterConfig,
@@ -190,7 +192,7 @@ fn build_inject_env(rt: &Runtime, filter_cfg: Option<&FilterConfig>) -> Vec<(Str
         .map(std::borrow::ToOwned::to_owned)
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
-    let new_path = format!("{}:{}", shims.display(), original_path);
+    let new_path = prepend_to_path(&shims, &original_path);
     let tokf_exe = std::env::current_exe()
         .unwrap_or_else(|_| "tokf".into())
         .to_string_lossy()
@@ -292,15 +294,20 @@ pub fn run_command(
         }
         let result = runner::execute_shell_with_env(&run_cmd, remaining_args, &env_refs)?;
         Ok((result, Some(executed)))
-    } else if words_consumed > 0 {
-        let cmd_str = command_args[..words_consumed].join(" ");
-        Ok((
-            runner::execute_with_env(&cmd_str, remaining_args, &env_refs)?,
-            None,
-        ))
     } else {
+        // Pass argv straight through. This used to join the matched prefix with
+        // spaces and let the runner split it again, which tore apart any element
+        // containing one — `C:\Program Files\node.exe` became two arguments and
+        // the program was reported as not found.
+        //
+        // words_consumed is how many argv elements the filter's `command`
+        // pattern matched (0 when nothing matched); element 0 is the program
+        // either way, so the rest of the matched prefix simply leads the args.
+        let prefix_end = words_consumed.max(1);
+        let mut args = command_args[1..prefix_end].to_vec();
+        args.extend_from_slice(remaining_args);
         Ok((
-            runner::execute_with_env(&command_args[0], remaining_args, &env_refs)?,
+            runner::execute_with_env(&command_args[0], &args, &env_refs)?,
             None,
         ))
     }
@@ -565,20 +572,35 @@ run = "pnpm test --reporter=dot {args}"
     #[test]
     fn build_inject_env_uses_original_path_when_nested() {
         // Simulate a nested invocation: TOKF_ORIGINAL_PATH is already set.
-        let rt = Runtime::builder().original_path("/usr/bin:/bin").build();
+        // Build the original value with the platform separator — hard-coding
+        // `:` is the #451 bug itself, and a test that assumes it cannot observe
+        // the fix.
+        let original = std::env::join_paths(["/usr/bin", "/bin"].iter())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let rt = Runtime::builder().original_path(&original).build();
         let shims = rt.shims_dir().unwrap();
         std::fs::create_dir_all(&shims).unwrap();
 
         let cfg = config_with_inject(true);
         let env = build_inject_env(&rt, Some(&cfg));
 
-        // PATH should be shims:/usr/bin:/bin (not shims:shims:/usr/bin:/bin)
         assert_eq!(env[1].0, "TOKF_ORIGINAL_PATH");
-        assert_eq!(env[1].1, "/usr/bin:/bin");
-        assert!(
-            env[0]
-                .1
-                .starts_with(&format!("{}:/usr/bin:/bin", shims.display()))
+        assert_eq!(env[1].1, original);
+
+        // PATH must be shims + the original entries, and must not stack the
+        // shims dir twice on a nested invocation. Compare parsed entries rather
+        // than a formatted string so the assertion holds on either separator.
+        let entries: Vec<std::path::PathBuf> = std::env::split_paths(&env[0].1).collect();
+        assert_eq!(
+            entries,
+            vec![
+                shims,
+                std::path::PathBuf::from("/usr/bin"),
+                std::path::PathBuf::from("/bin"),
+            ],
+            "expected the shims dir once, then the original entries"
         );
     }
 
@@ -605,7 +627,9 @@ run = "pnpm test --reporter=dot {args}"
         )
         .unwrap();
 
-        assert_eq!(result.stdout.trim(), "substituted extra");
+        // PowerShell's `echo` is Write-Output, one line per argument; `sh`
+        // emits a single space-separated line. Both substituted both words.
+        assert_eq!(result.stdout.trim().replace('\n', " "), "substituted extra");
         assert_eq!(
             executed.as_deref(),
             // Args are shell-quoted: this is the literal line handed to `sh`.
